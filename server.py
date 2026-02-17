@@ -116,6 +116,30 @@ def visit():
 def health():
     return jsonify({"status": "ok"})
 
+@app.route("/api/clicks/<int:session_num>")
+def get_session_clicks(session_num):
+    """API endpoint for bot to fetch clicks for a session."""
+    con = sqlite3.connect(DB_PATH)
+    rows = con.execute(
+        "SELECT post_num, tg_id, tg_username, x_username, x_link, clicked_at "
+        "FROM clicks WHERE session_num=? ORDER BY clicked_at",
+        (session_num,)
+    ).fetchall()
+    con.close()
+    
+    clicks = []
+    for row in rows:
+        clicks.append({
+            "post_num": row[0],
+            "tg_id": row[1],
+            "tg_username": row[2],
+            "x_username": row[3],
+            "x_link": row[4],
+            "clicked_at": row[5]
+        })
+    
+    return jsonify({"clicks": clicks})
+
 import os
 
 if __name__ == "__main__":
