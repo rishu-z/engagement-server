@@ -1,205 +1,105 @@
 """
-server.py — Tracking Server with SQLite
-
-Use with the Telegram bot by setting:
-  SERVER_URL=<this service URL>
-
-Optional query args accepted by /visit:
-  uid, post, sess, target, uname, xuser
+Minimal Tracking Server for Railway
 """
 
-from datetime import datetime
-from urllib.parse import urlparse
-import os
+from flask import Flask, redirect, request, jsonify
 import sqlite3
-
-from flask import Flask, jsonify, redirect, request
+import os
+from datetime import datetime
+from urllib.parse import unquote
 
 app = Flask(__name__)
 
-DB_PATH = os.environ.get("DB_PATH", "clicks.db")
+DB_PATH = os.environ.get("DB_PATH", "/tmp/clicks.db")
 
-# Optional in-memory refs (if injected when running bot + server in same process)
-session_links_ref = {}  # post_num -> {url, poster_id, x_username, ...}
-user_cache_ref = {}     # tg_id -> telegram.User
-
-
-# ──────────────────────────────────────────────────────────────
-# DB
-# ──────────────────────────────────────────────────────────────
-def get_db_conn():
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    return con
-
-
+# ── Database ────────────────────────────────────────────────────
 def init_db():
-    con = get_db_conn()
-    con.execute(
-        """
+    con = sqlite3.connect(DB_PATH)
+    con.execute("""
         CREATE TABLE IF NOT EXISTS clicks (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_num   INTEGER NOT NULL,
-            post_num      INTEGER NOT NULL,
-            tg_id         INTEGER NOT NULL,
-            tg_username   TEXT,
-            x_username    TEXT,
-            x_link        TEXT,
-            clicked_at    TEXT NOT NULL
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_num INTEGER,
+            post_num INTEGER,
+            tg_id INTEGER,
+            tg_username TEXT,
+            x_username TEXT,
+            x_link TEXT,
+            clicked_at TEXT
         )
-        """
-    )
-    con.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_click_unique
-        ON clicks(session_num, post_num, tg_id)
-        """
-    )
+    """)
     con.commit()
     con.close()
-
 
 init_db()
 
-
-def _extract_x_username(url: str) -> str:
-    if not url:
-        return "Unknown"
-    try:
-        parsed = urlparse(url)
-        if "x.com" not in parsed.netloc.lower():
-            return "Unknown"
-        path_parts = [p for p in parsed.path.split("/") if p]
-        if not path_parts:
-            return "Unknown"
-        return path_parts[0].replace("@", "")
-    except Exception:
-        return "Unknown"
-
-
 def save_click(session_num, post_num, tg_id, tg_username, x_username, x_link):
-    """Save one click to SQLite; ignore duplicates for same (session, post, user)."""
-    con = get_db_conn()
-    con.execute(
-        """
-        INSERT OR IGNORE INTO clicks
-          (session_num, post_num, tg_id, tg_username, x_username, x_link, clicked_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            session_num,
-            post_num,
-            tg_id,
-            tg_username,
-            x_username,
-            x_link,
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        ),
-    )
-    con.commit()
+    con = sqlite3.connect(DB_PATH)
+    row = con.execute(
+        "SELECT id FROM clicks WHERE session_num=? AND post_num=? AND tg_id=?",
+        (session_num, post_num, tg_id)
+    ).fetchone()
+    if not row:
+        con.execute(
+            "INSERT INTO clicks (session_num,post_num,tg_id,tg_username,x_username,x_link,clicked_at) VALUES (?,?,?,?,?,?,?)",
+            (session_num, post_num, tg_id, tg_username, x_username, x_link,
+             datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        )
+        con.commit()
     con.close()
 
-
-# ──────────────────────────────────────────────────────────────
-# Routes
-# ──────────────────────────────────────────────────────────────
-@app.route("/visit")
-def visit():
-    """
-    Track a click and redirect.
-
-    Supported URL format:
-      /visit?uid=<tg_id>&post=<post_num>&sess=<session_num>&target=<url>
-    """
-    try:
-        uid = int(request.args.get("uid", 0))
-        post_num = int(request.args.get("post", 0))
-        sess_num = int(request.args.get("sess", 0))
-    except (ValueError, TypeError):
-        return "Bad request", 400
-
-    link_info = session_links_ref.get(post_num)
-
-    target_url = (request.args.get("target") or "").strip()
-    if not target_url and link_info:
-        target_url = (link_info.get("url") or "").strip()
-    if not target_url:
-        target_url = "https://x.com"
-
-    # Avoid logging own link click when poster_id is known.
-    if link_info and uid == link_info.get("poster_id"):
-        return redirect(target_url)
-
-    # tg_username from query -> cache -> fallback
-    tg_username = (request.args.get("uname") or "").strip()
-    if not tg_username:
-        cached = user_cache_ref.get(uid)
-        if cached and getattr(cached, "username", None):
-            tg_username = f"@{cached.username}"
-        elif cached:
-            tg_username = getattr(cached, "full_name", f"User {uid}")
-        else:
-            tg_username = f"User {uid}"
-
-    x_username = (request.args.get("xuser") or "").replace("@", "").strip()
-    if not x_username and link_info:
-        x_username = (link_info.get("x_username") or "").replace("@", "").strip()
-    if not x_username:
-        x_username = _extract_x_username(target_url)
-
-    save_click(
-        session_num=sess_num,
-        post_num=post_num,
-        tg_id=uid,
-        tg_username=tg_username,
-        x_username=f"@{x_username}" if x_username != "Unknown" else "Unknown",
-        x_link=target_url,
-    )
-    return redirect(target_url)
-
+# ── Routes ──────────────────────────────────────────────────────
+@app.route("/")
+def index():
+    return jsonify({"status": "ok", "service": "engagement-tracker"})
 
 @app.route("/health")
 def health():
     return jsonify({"status": "ok"})
 
+@app.route("/track")
+def track_visit():
+    """Track click and redirect to X."""
+    try:
+        uid = int(request.args.get("uid", 0))
+        post = int(request.args.get("post", 0))
+        sess = int(request.args.get("sess", 1))
+        x_user = request.args.get("x", "Unknown")
+        link = unquote(request.args.get("link", ""))
+    except:
+        return redirect("https://x.com")
+
+    if not link or not uid:
+        return redirect("https://x.com")
+
+    save_click(sess, post, uid, f"User{uid}", x_user, link)
+    return redirect(link)
 
 @app.route("/api/clicks/<int:session_num>")
-def get_session_clicks(session_num):
-    con = get_db_conn()
+def get_clicks(session_num):
+    """Return clicks for session."""
+    con = sqlite3.connect(DB_PATH)
     rows = con.execute(
-        """
-        SELECT post_num, tg_id, tg_username, x_username, x_link, clicked_at
-        FROM clicks
-        WHERE session_num=?
-        ORDER BY clicked_at
-        """,
-        (session_num,),
+        "SELECT post_num, tg_id, tg_username, x_username, x_link, clicked_at "
+        "FROM clicks WHERE session_num=?",
+        (session_num,)
     ).fetchall()
     con.close()
-
-    clicks = [
-        {
-            "post_num": row["post_num"],
-            "tg_id": row["tg_id"],
-            "tg_username": row["tg_username"],
-            "x_username": row["x_username"],
-            "x_link": row["x_link"],
-            "clicked_at": row["clicked_at"],
-        }
-        for row in rows
-    ]
-    return jsonify({"clicks": clicks})
-
-
-@app.route("/api/clear/<int:session_num>", methods=["POST"])
-def clear_session_clicks(session_num):
-    con = get_db_conn()
-    con.execute("DELETE FROM clicks WHERE session_num=?", (session_num,))
-    con.commit()
-    con.close()
-    return jsonify({"ok": True, "session": session_num})
-
+    
+    return jsonify({
+        "clicks": [
+            {
+                "post_num": r[0],
+                "tg_id": r[1],
+                "tg_username": r[2],
+                "x_username": r[3],
+                "x_link": r[4],
+                "clicked_at": r[5]
+            }
+            for r in rows
+        ]
+    })
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    print(f"🚀 Server starting on port {port}")
+    app.run(host="0.0.0.0", port=port)
